@@ -154,9 +154,51 @@ class ReverseTests(unittest.TestCase):
         self.plan('20200101','20200102','day','trade_date');self.accept(['2']);self.accept(['1'])
         self.engine.plan('a',{},'20200101','20200104','day','trade_date',True,revise=True)
         args,p,c=self.engine.request_params(self.job())
-        self.assertEqual(args['trade_date'],'20200104');self.assertEqual(p['ascending_prefix']['date'],'20200102')
+        self.assertEqual(args['trade_date'],'20200104');self.assertEqual(p['incremental_scope']['date'],'20200102')
     def test_editing_unfinished_end_requires_explicit_replay(self):
         self.plan('20200101','20200102','day','trade_date');before=self.job()['cursor']
         with self.assertRaisesRegex(ValueError,'尚未完成'):self.engine.plan('a',{},'20200101','20200104','day','trade_date',True,revise=True)
         self.assertEqual(self.job()['cursor'],before)
+    def test_quarter_tokens_include_earliest_quarter_across_year_boundary(self):
+        self.engine.catalog['a']['inputs']=[dict(name='q',required=False)]
+        self.plan('20191001','20260930','quarter','q')
+        calls=[]
+        while self.job()['status']!='complete':calls.append(self.accept(['record'])[0]['q'])
+        expected=[f'{y}Q{q}' for y in range(2026,2018,-1) for q in (4,3,2,1) if '2019Q4'<=f'{y}Q{q}'<='2026Q3']
+        self.assertEqual(calls,expected)
+    def test_quarter_range_and_period_keep_aligned_checkpoints(self):
+        from history import reverse_advance
+        for schema,args in [(dict(key='start_q'),dict(start_q='2026Q2')),(dict(key='period'),dict(period='20260630'))]:
+            p=dict(mode='quarter',schema=schema,start='20260331',end='20260930',params={})
+            self.assertEqual(reverse_advance(p,dict(date='20260630',variant=0),args)['date'],'20260331')
+    def test_completed_multi_symbol_update_limits_all_existing_symbols(self):
+        self.plan('20200101','20200120','day','trade_date',{'ts_code':['A','B']})
+        while self.job()['status']!='complete':self.accept(['record'])
+        self.engine.update('a','20200122');calls=[]
+        while self.job()['status']!='complete':calls.append(self.accept(['record'])[0])
+        for code in ('A','B'):
+            dates=[a['trade_date'] for a in calls if a['ts_code']==code]
+            self.assertEqual((min(dates),max(dates),len(dates)),('20200113','20200122',10))
+    def test_revised_completed_multi_category_plan_applies_same_floor(self):
+        params={'market':['A','B'],'kind':['X','Y']}
+        self.plan('20200101','20200120','day','trade_date',params)
+        while self.job()['status']!='complete':self.accept(['record'])
+        self.engine.plan('a',params,'20200101','20200122','day','trade_date',True,revise=True)
+        calls=[]
+        while self.job()['status']!='complete':calls.append(self.accept(['record'])[0])
+        self.assertEqual(len(calls),12)
+        self.assertTrue(all(a['trade_date']>='20200120' for a in calls))
+    def test_incremental_scope_survives_restart_and_policy_edit(self):
+        self.plan('20200101','20200120','day','trade_date',{'ts_code':['A','B']})
+        while self.job()['status']!='complete':self.accept(['record'])
+        self.engine.update('a','20200122');self.accept(['record'])
+        before=self.job()['cursor'];scope=json.loads(self.job()['plan'])['incremental_scope']
+        self.engine=Engine(self.store,[copy.deepcopy(ENTRY)],data_root=self.engine.data_root)
+        self.engine.plan('a',{'ts_code':['A','B']},'20200101','20200122','day','trade_date',True,revise=True)
+        self.assertEqual(self.job()['cursor'],before);self.assertEqual(json.loads(self.job()['plan'])['incremental_scope'],scope)
+    def test_new_parameter_combination_does_not_inherit_old_incremental_floor(self):
+        from history import floor
+        p=dict(start='20200101',params={'ts_code':['A','B']},incremental_scope={'date':'20200113','params':{'ts_code':['B']}})
+        self.assertEqual(floor(p,dict(variant=0)),'20200101')
+        self.assertEqual(floor(p,dict(variant=1)),'20200113')
 if __name__=='__main__':unittest.main()

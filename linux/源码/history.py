@@ -57,6 +57,17 @@ def floor(plan,cursor):
     lower=plan['start']
     migration=plan.get('ascending_prefix')
     if migration and cursor['variant']==migration['variant']:lower=max(lower,migration['date'])
+    incremental=plan.get('incremental_scope')
+    if incremental:
+        # Apply the incremental floor to every previously completed combination.
+        # Newly added securities/categories still need their full history.
+        values=plan.get('resolved_params',plan['params']);index=cursor['variant'];combo={}
+        for key,value in reversed(list(values.items())):
+            choices=value if isinstance(value,list) else [value]
+            if not choices:return lower
+            combo[key]=choices[index%len(choices)];index//=len(choices)
+        old=incremental['params']
+        if set(combo)==set(old) and all(v in (old[k] if isinstance(old[k],list) else [old[k]]) for k,v in combo.items()):lower=max(lower,incremental['date'])
     return max(lower,plan.get('verified_history_start',lower))
 
 def reverse_dates(args,plan,cursor):
@@ -72,6 +83,9 @@ def reverse_advance(plan,cursor,args):
     from dates import parse_bound
     result=dict(cursor)
     first=parse_bound(args[plan['schema']['key']])
+    if plan['mode']=='quarter':
+        from dates import align
+        first=align(first,'quarter')
     result.update(offset=0,previous='',date=previous(first,plan['mode']))
     result.pop('window_days',None)
     if result['date']<floor(plan,cursor):result.update(variant=cursor['variant']+1,date=latest(plan))

@@ -63,8 +63,12 @@ class Engine(BaseEngine):
         row=self.store.rows('SELECT * FROM jobs WHERE id=?',(ident,))[0];p=json.loads(row['plan'])
         if p.get('mode')!='snapshot':
             c=json.loads(row['cursor']);p.pop('direction',None);p.pop('ascending_prefix',None)
+            completed=bool(j and j[0]['status']=='complete')
+            if completed:
+                prior=json.loads(j[0]['plan'])
+                p['incremental_scope']={'date':c['date'],'params':prior.get('resolved_params',prior['params'])}
             with self.store.db() as db:db.execute('UPDATE jobs SET plan=? WHERE id=?',(json.dumps(p),ident))
-            self.reverse_job(self.store.rows('SELECT * FROM jobs WHERE id=?',(ident,))[0])
+            self.reverse_job(self.store.rows('SELECT * FROM jobs WHERE id=?',(ident,))[0],fresh=completed)
         with self.store.db() as db:db.execute("UPDATE jobs SET block_reason='' WHERE id=?",(ident,))
     def closed_days(self):
         files=self.store.rows("SELECT path,time FROM files WHERE job='trade_cal'")
@@ -146,9 +150,16 @@ class Engine(BaseEngine):
         replay=not before or kwargs.get('replay') or prior.get('bulk_placeholder') or any(prior.get(k)!=current.get(k) for k in ('params','start','mode','key')) or current.get('end','')<prior.get('end','')
         if before and prior.get('direction')=='desc' and row['cursor']==before[0]['cursor'] and not replay:
             old=json.loads(before[0]['plan']);p=json.loads(row['plan']);p['direction']='desc'
-            if 'ascending_prefix' in old:p['ascending_prefix']=old['ascending_prefix']
+            for name in ('ascending_prefix','incremental_scope'):
+                if name in old:p[name]=old[name]
             with self.store.db() as db:db.execute('UPDATE jobs SET plan=? WHERE id=?',(json.dumps(p),ident))
-        else:self.reverse_job(row,fresh=bool(replay))
+        else:
+            completed_increment=bool(before and before[0]['status']=='complete' and row['status']=='pending' and not replay and current.get('mode')!='snapshot')
+            if completed_increment:
+                current['incremental_scope']={'date':json.loads(row['cursor'])['date'],'params':prior.get('resolved_params',prior['params'])}
+                with self.store.db() as db:db.execute('UPDATE jobs SET plan=? WHERE id=?',(json.dumps(current),ident))
+                row=self.store.rows('SELECT * FROM jobs WHERE id=?',(ident,))[0]
+            self.reverse_job(row,fresh=bool(replay or completed_increment))
         return result
     @staticmethod
     def dependencies(plan):
