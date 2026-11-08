@@ -18,6 +18,9 @@ def default_window(plan):
 
 def bounds(plan,cursor,args):
     start=cursor['date'];end=start
+    if plan.get('direction')=='desc':
+        from dates import parse_bound
+        return parse_bound(args[plan['schema']['key']]),parse_bound(args.get(plan['schema'].get('end_key'),args[plan['schema']['key']]),True)
     if plan['mode']=='range' and plan['schema']['format']=='day':end=args[plan['schema']['end_key']]
     return start,end
 
@@ -32,3 +35,48 @@ def earliest(api,fields,items,start,end):
         if not start<=value<=end:raise ValueError('交易日历返回日期超出请求区间，保留断点')
         dates.append(value)
     return min(dates) if dates else None
+
+
+def previous(value,mode='day'):
+    import calendar
+    d=dt.datetime.strptime(value,'%Y%m%d').date()
+    if mode in ('month','quarter'):
+        m=d.month-(3 if mode=='quarter' else 1);y=d.year+(m-1)//12;m=(m-1)%12+1
+        d=dt.date(y,m,calendar.monthrange(y,m)[1] if mode=='quarter' else 1)
+    elif mode=='year':d=dt.date(d.year-1,1,1)
+    else:d-=dt.timedelta(days=1)
+    return d.strftime('%Y%m%d')
+
+def latest(plan):
+    from dates import align
+    value=align(plan['end'],plan['mode'])
+    if value>plan['end']:value=previous(value,plan['mode'])
+    return value
+
+def floor(plan,cursor):
+    lower=plan['start']
+    migration=plan.get('ascending_prefix')
+    if migration and cursor['variant']==migration['variant']:lower=max(lower,migration['date'])
+    return max(lower,plan.get('verified_history_start',lower))
+
+def reverse_dates(args,plan,cursor):
+    from dates import render
+    schema=plan['schema'];end=cursor['date'];start=end
+    if plan['mode']=='range' and schema['format'] in ('day','datetime'):
+        days=cursor.get('window_days',365)
+        start=max(floor(plan,cursor),(dt.datetime.strptime(end,'%Y%m%d')-dt.timedelta(days=days-1)).strftime('%Y%m%d'))
+    args[schema['key']]=render(start,schema['format'])
+    if schema.get('end_key'):args[schema['end_key']]=render(end,schema['format'],True)
+
+def reverse_advance(plan,cursor,args):
+    from dates import parse_bound
+    result=dict(cursor)
+    first=parse_bound(args[plan['schema']['key']])
+    result.update(offset=0,previous='',date=previous(first,plan['mode']))
+    result.pop('window_days',None)
+    if result['date']<floor(plan,cursor):result.update(variant=cursor['variant']+1,date=latest(plan))
+    return result
+
+def empty_limit(plan):
+    # Five years of empty history merits verification, never inferred completion.
+    return {'day':1826,'month':60,'quarter':20,'year':5}.get(plan['mode'],5)

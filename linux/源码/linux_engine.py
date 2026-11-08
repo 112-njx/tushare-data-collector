@@ -7,6 +7,8 @@ import time
 from pathlib import Path
 from core import Engine as BaseEngine,Store as BaseStore,CredentialError,RemoteError,DependencyPending,NarrowWindow,DENIED,DATA_ROOT,stamp,secret
 
+from history import latest,floor,previous,reverse_dates
+
 RETRY_SECONDS=30
 class DirectoryUnavailable(ValueError):pass
 
@@ -27,23 +29,121 @@ class Engine(BaseEngine):
         super().__init__(store,catalog,transport,data_root)
         self.local=threading.local();self.busy={};self.workers=[]
         self.thread=threading.Thread(target=self.supervise,name='采集调度器',daemon=True)
-        self.phase='paused'
+        self.phase='paused';self.calendar_cache=None
+        for job in store.rows('SELECT * FROM jobs'):self.reverse_job(job)
         # Old or manually imported plans cannot override the hard exclusion.
         with store.db() as db:
             for entry in self.catalog.values():
                 if entry.get('independent'):
                     db.execute("UPDATE jobs SET status='excluded',error='Linux版排除独立权限接口' WHERE id=?",(entry['id'],))
+    def reverse_job(self,j,fresh=False):
+        p=json.loads(j['plan']);c=json.loads(j['cursor'])
+        if p.get('bulk_placeholder') or p.get('mode')=='snapshot' or p.get('direction')=='desc' or j['status'] in ('complete','excluded'):return j
+        # Finish any partially saved ascending page window before changing direction.
+        if c.get('offset'):return j
+        before=j['plan'];old_cursor=j['cursor']
+        p['direction']='desc';p['history_version']=1
+        if not fresh:p['ascending_prefix']={'variant':c['variant'],'date':c['date']}
+        c.update(date=latest(p),offset=0,previous='');c.pop('window_days',None)
+        status=j['status'];error=j['error']
+        if status=='blocked' and '历史覆盖待核验' in error:status='pending';error=''
+        with self.store.db() as db:
+            db.execute('INSERT INTO revisions(job,time,previous_plan,previous_cursor,previous_status) VALUES(?,?,?,?,?)',(j['id'],stamp(),before,old_cursor,j['status']))
+            db.execute('UPDATE jobs SET plan=?,cursor=?,status=?,error=? WHERE id=?',(json.dumps(p),json.dumps(c),status,error,j['id']))
+            db.execute('UPDATE history_summary SET empty_streak=0 WHERE job=?',(j['id'],))
+            db.execute('DELETE FROM retries WHERE job=?',(j['id'],))
+        self.store.log('历史查询切换为最新向前倒查，保留已提交区间：'+j['title']+'；下一日期 '+c['date'])
+        return self.store.rows('SELECT * FROM jobs WHERE id=?',(j['id'],))[0]
+    def update(self,ident,end=None):
+        self.paused()
+        j=self.store.rows('SELECT * FROM jobs WHERE id=?',(ident,))
+        if j and json.loads(j[0]['plan']).get('direction')=='desc' and j[0]['status']!='complete':
+            raise ValueError('倒序历史尚未走完，请先续采原范围；完成后再更新至今天，避免覆盖未完成断点')
+        super().update(ident,end)
+        row=self.store.rows('SELECT * FROM jobs WHERE id=?',(ident,))[0];p=json.loads(row['plan'])
+        if p.get('mode')!='snapshot':
+            c=json.loads(row['cursor']);p.pop('direction',None);p.pop('ascending_prefix',None)
+            with self.store.db() as db:db.execute('UPDATE jobs SET plan=? WHERE id=?',(json.dumps(p),ident))
+            self.reverse_job(self.store.rows('SELECT * FROM jobs WHERE id=?',(ident,))[0])
+        with self.store.db() as db:db.execute("UPDATE jobs SET block_reason='' WHERE id=?",(ident,))
+    def closed_days(self):
+        files=self.store.rows("SELECT path,time FROM files WHERE job='trade_cal'")
+        signature=tuple((f['path'],f['time']) for f in files)
+        if self.calendar_cache and self.calendar_cache[0]==signature:return self.calendar_cache[1]
+        result={}
+        for f in files:
+            path=Path(f['path'])
+            if self.data_root.resolve() not in path.resolve().parents:continue
+            try:
+                data=json.loads(path.read_text(encoding='utf-8'));fields=data['fields']
+                if not {'cal_date','is_open'}<=set(fields):continue
+                for row in data['items']:
+                    item=dict(zip(fields,row));exchange=item.get('exchange') or data.get('params',{}).get('exchange')
+                    if exchange:
+                        key=(exchange,str(item['cal_date']));result[key]=result.get(key,True) and str(item['is_open'])=='0'
+            except (OSError,ValueError,KeyError):continue
+        self.calendar_cache=(signature,result);return result
+    def historical_boundary(self,j,args,plan):
+        entry=self.catalog[j['id']]
+        if entry.get('history_start'):return entry['history_start']
+        # Listing dates bound trading records, not pre-IPO financial/event records.
+        field='list_date' if plan['key']=='trade_date' else 'found_date' if plan['key']=='nav_date' else None
+        reference=plan['params'].get('ts_code')
+        if not field or not isinstance(reference,dict) or '$catalog' not in reference:return None
+        source=reference['$catalog'];files=[(Path(f['path']),None) for f in self.store.rows('SELECT path FROM files WHERE job=?',(source,))]
+        if self.store.rows("SELECT name FROM sqlite_master WHERE type='table' AND name='baseline_catalog'"):
+            files.extend((Path(f['path']),f['sha256']) for f in self.store.rows('SELECT path,sha256 FROM baseline_catalog WHERE job=?',(source,)))
+        found=[]
+        for path,digest in files:
+            allowed=self.store.root.parent/'基线' if digest else self.data_root
+            if allowed.resolve() not in path.resolve().parents:raise ValueError('历史边界目录路径越界')
+            content=path.read_bytes()
+            if digest and hashlib.sha256(content).hexdigest()!=digest:raise ValueError('历史边界目录校验失败')
+            data=json.loads(content);fields=data['fields']
+            if not {field,'ts_code'}<=set(fields):continue
+            for row in data['items']:
+                if row[fields.index('ts_code')]==args.get('ts_code'):
+                    value=str(row[fields.index(field)])
+                    if len(value)==8 and value.isdigit():found.append(value)
+        return min(found) if found else None
+    def request_params(self,j):
+        p=json.loads(j['plan']);c=json.loads(j['cursor'])
+        if p.get('direction')=='desc' and p['mode']=='day' and p['key']=='trade_date' and not c.get('offset'):
+            closed=self.closed_days();exchanges=[];params=p.get('resolved_params',p['params']);code=params.get('ts_code')
+            if isinstance(params.get('exchange'),str):exchanges=[params['exchange']]
+            elif isinstance(code,str) and code.endswith(('.SH','.SZ','.BJ')):exchanges=[{'.SH':'SSE','.SZ':'SZSE','.BJ':'BSE'}[code[-3:]]]
+            elif self.catalog[j['id']].get('group','').startswith('股票'):exchanges=['SSE','SZSE','BSE']
+            count=0
+            while exchanges and c['date']>floor(p,c) and all(closed.get((e,c['date'])) is True for e in exchanges):
+                c['date']=previous(c['date']);count+=1
+            if count:
+                with self.store.db() as db:db.execute('UPDATE jobs SET cursor=? WHERE id=?',(json.dumps(c),j['id']))
+                j=dict(j,cursor=json.dumps(c));self.store.log('依据已保存交易日历跳过'+str(count)+'个休市日期：'+j['title'])
+        args,p,c=super().request_params(j)
+        if args is not None and p.get('direction')=='desc':
+            boundary=self.historical_boundary(j,args,p)
+            if boundary:
+                import datetime as dt
+                dt.datetime.strptime(boundary,'%Y%m%d')
+                p=dict(p,verified_history_start=boundary)
+                if c['date']<floor(p,c):raise ValueError('所选未采集范围早于已核验的历史起点，请核对计划范围：'+boundary)
+                reverse_dates(args,p,c)
+        return args,p,c
     def plan(self,ident,*args,**kwargs):
         if self.catalog.get(ident,{}).get('independent'):raise ValueError('Linux版不采集需要独立权限的接口')
+        before=self.store.rows('SELECT * FROM jobs WHERE id=?',(ident,))
         result=super().plan(ident,*args,**kwargs)
         with self.store.db() as db:
             p=json.loads(db.execute('SELECT plan FROM jobs WHERE id=?',(ident,)).fetchone()['plan'])
             p['dependencies']=self.dependencies(p)
             db.execute("UPDATE jobs SET plan=?,block_reason='' WHERE id=?",(json.dumps(p),ident))
+        row=self.store.rows('SELECT * FROM jobs WHERE id=?',(ident,))[0]
+        if before and json.loads(before[0]['plan']).get('direction')=='desc' and row['cursor']==before[0]['cursor'] and not kwargs.get('replay'):
+            old=json.loads(before[0]['plan']);p=json.loads(row['plan']);p['direction']='desc'
+            if 'ascending_prefix' in old:p['ascending_prefix']=old['ascending_prefix']
+            with self.store.db() as db:db.execute('UPDATE jobs SET plan=? WHERE id=?',(json.dumps(p),ident))
+        else:self.reverse_job(row,fresh=True)
         return result
-    def update(self,ident,end=None):
-        super().update(ident,end)
-        with self.store.db() as db:db.execute("UPDATE jobs SET block_reason='' WHERE id=?",(ident,))
     @staticmethod
     def dependencies(plan):
         return sorted(set(plan.get('dependencies',[]))|{v['$catalog'] for v in plan.get('params',{}).values() if isinstance(v,dict) and '$catalog' in v})
@@ -129,6 +229,7 @@ class Engine(BaseEngine):
         for j in rows:
             ident=j['id']
             if self.selected and ident!=self.selected or ident in self.busy.values():continue
+            j=self.reverse_job(j)
             entry=self.catalog[ident];p=json.loads(j['plan'])
             if j['status']=='blocked':
                 if j.get('block_reason')!='dependency':continue
@@ -161,6 +262,7 @@ class Engine(BaseEngine):
                 # A repaired dependency is runnable even while its quota is cooling.
                 # settle() must keep the queue alive until that future request is due.
                 with self.store.db() as db:db.execute("UPDATE jobs SET status='pending',error='',block_reason='' WHERE id=?",(ident,))
+            if self.store.get('next_due',0)>time.time():return None
             fingerprint=hashlib.sha256(json.dumps([ident,args,entry['fields']],sort_keys=True).encode()).hexdigest()
             retry=self.store.rows('SELECT * FROM retries WHERE job=? AND request_key=?',(ident,fingerprint))
             attempts=retry[0]['attempts'] if retry else 0

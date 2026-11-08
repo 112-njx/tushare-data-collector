@@ -25,7 +25,11 @@ def verify(archive):
                 for old in baseline['jobs']:
                     if old['records']:
                         now=db.execute('SELECT * FROM jobs WHERE id=?',(old['id'],)).fetchone()
-                        assert json.loads(now['cursor'])==old['cursor'],old['id']+' cursor reset'
+                        plan=json.loads(now['plan'])
+                        if plan.get('direction')=='desc':
+                            assert plan['ascending_prefix']=={'variant':old['cursor']['variant'],'date':old['cursor']['date']},old['id']+' committed prefix lost'
+                            assert json.loads(now['cursor'])['variant']==old['cursor']['variant']
+                        else:assert json.loads(now['cursor'])==old['cursor'],old['id']+' cursor reset'
                         assert now['records']==old['records'] and now['batches']==old['batches']
             db.execute('INSERT OR REPLACE INTO settings VALUES(?,?)',('resume_requested','false'))
         process=subprocess.Popen([binary,'--no-browser'],env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)

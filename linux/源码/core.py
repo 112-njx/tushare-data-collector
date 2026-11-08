@@ -16,7 +16,7 @@ import urllib.request
 import urllib.error
 import urllib.parse
 from dates import align,extend_snapshot,options,spec,request_dates
-from history import preferred_schema,default_window,bounds,next_day,earliest
+from history import preferred_schema,default_window,bounds,next_day,earliest,reverse_dates,reverse_advance,empty_limit
 
 DATA_ROOT=Path(os.environ.get('COLLECTOR_HOME',Path(__file__).resolve().parents[1]))/'mydb'/'Tushare'
 PROXY_URL='http://tus.sxdata.top/tu_share/'
@@ -298,7 +298,8 @@ class Engine:
         args=dict(zip(names,variant));mode=p['mode'];date=c['date']
         if mode!='snapshot' and date>p['end']:return None,p,c
         request_dates(args,spec(self.catalog[j['id']],mode,p['key']),date)
-        if p.get('history_version') and mode=='range' and p['schema']['format']=='day':
+        if p.get('direction')=='desc':reverse_dates(args,p,c)
+        elif p.get('history_version') and mode=='range' and p['schema']['format']=='day':
             days=c.get('window_days',default_window(p))
             args[p['schema']['end_key']]=min(p['end'],(dt.datetime.strptime(date,'%Y%m%d')+dt.timedelta(days=days-1)).strftime('%Y%m%d'))
         if p['offset']:args.update(limit=p['cap'],offset=c['offset'])
@@ -313,8 +314,9 @@ class Engine:
         if items and c.get('previous')==digest:raise ValueError('连续分页返回相同数据，可能未支持offset；停止，断点不推进')
         full=len(items)>=p['cap']
         if full and not p['offset']:
-            if p.get('history_version') and p['mode']=='range' and p['schema']['format']=='day':
-                span=(dt.datetime.strptime(args[p['schema']['end_key']],'%Y%m%d')-dt.datetime.strptime(c['date'],'%Y%m%d')).days+1
+            if p.get('history_version') and p['mode']=='range' and p['schema']['format'] in ('day','datetime'):
+                start,end=bounds(p,c,args)
+                span=(dt.datetime.strptime(end,'%Y%m%d')-dt.datetime.strptime(start,'%Y%m%d')).days+1
                 if span>1:raise NarrowWindow(max(1,span//2))
             raise ValueError('返回达到文档保守上限，无法证明完整；请缩小范围或确认分页支持，保留断点')
         cursor=dict(c)
@@ -324,6 +326,7 @@ class Engine:
             cursor.update(offset=0,previous='',date=next_date(last,p['mode']))
             cursor.pop('window_days',None)
             if p['mode']=='snapshot' or cursor['date']>p['end']:cursor.update(variant=c['variant']+1,date=p['start'])
+            if p.get('direction')=='desc':cursor=reverse_advance(p,c,args)
         total=1
         for v in p.get('resolved_params',p['params']).values():total*=len(v) if isinstance(v,list) else 1
         status='complete' if cursor['variant']>=total else 'pending'
@@ -333,18 +336,18 @@ class Engine:
             rows=self.store.rows('SELECT * FROM history_summary WHERE job=? AND variant=?',(j['id'],c['variant']))
             history=rows[0] if rows else dict(first_start=None,first_end=None,first_date=None,empty_streak=0,empty_count=0)
             if items:
-                if history['first_start'] is None:history.update(first_start=start,first_end=end,first_date=first)
+                if history['first_start'] is None or start<history['first_start']:history.update(first_start=start,first_end=end,first_date=first)
                 history['empty_streak']=0
             else:
                 history['empty_streak']+=1;history['empty_count']+=1
-                threshold=40 if default_window(p)>1 else 32
-                if (cursor['variant']!=c['variant'] and history['first_start'] is None) or history['empty_streak']>=threshold:
+                threshold=empty_limit(p) if p.get('direction')=='desc' else 40 if default_window(p)>1 else 32
+                if ((cursor['variant']!=c['variant'] and history['first_start'] is None) or history['empty_streak']>=threshold) and not p.get('verified_history_start'):
                     raise ValueError('历史覆盖待核验：连续空结果或整个范围没有记录；保留当前断点，不标记完成。请核对代理历史范围/请求条件')
             if not items:
                 with self.store.db() as db:
                     self.save_history(db,j,c,start,end,0,history)
                     db.execute("UPDATE jobs SET cursor=?,status=?,error='' WHERE id=?",(json.dumps(cursor),status,j['id']))
-                self.store.log('历史区间无记录（仅保存核验断点，不生成空数据文件）：'+j['title']+'；'+start+'至'+end)
+                self.store.log('历史区间无记录（仅保存核验断点，不生成空数据文件）：'+j['title']+'；'+start+'至'+end+'；下一断点 '+cursor['date']+('（倒序）' if p.get('direction')=='desc' else ''))
                 return status
         if not items:
             # Empty snapshots are checks, not data files.
