@@ -44,7 +44,7 @@ def profile(entry,catalog):
     if ident=='fut_weekly_detail':return params,schema,'周序号接口尚无可靠历史分片规则，需高级配置确认'
     return params,schema,''
 
-def build(engine,start,end,include_independent=False,include_overlap=False):
+def build(engine,start,end,include_independent=False,include_overlap=False,preserve_existing=False):
     from core import DENIED,stamp
     import datetime as dt
     engine.paused()
@@ -54,6 +54,9 @@ def build(engine,start,end,include_independent=False,include_overlap=False):
     entries=sorted(engine.catalog.values(),key=lambda e:(FOUNDATIONS.index(e['id']) if e['id'] in FOUNDATIONS else 100,e['group'],e['id']))
     for entry in entries:
         ident=entry['id'];old=engine.store.rows('SELECT * FROM jobs WHERE id=?',(ident,));reason='';state='pending'
+        if preserve_existing and old and not json.loads(old[0]['plan']).get('bulk_placeholder'):
+            report.append(dict(id=ident,title=entry['title'],status='kept',reason='保留已有计划范围、参数、状态及断点；配置账号不重放或自动延长历史'))
+            continue
         if entry.get('excluded') or ident in DENIED:state='excluded';reason='本地重复数据或非采集接口'
         elif ident+'_vip' in engine.catalog:state='excluded';reason='由同字段全市场VIP接口覆盖，避免重复拉取'
         elif entry.get('independent'):state='excluded';reason='Linux版自动排除独立权限接口，不发送请求'

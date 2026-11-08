@@ -8,6 +8,7 @@ from pathlib import Path
 from core import Engine as BaseEngine,Store as BaseStore,CredentialError,RemoteError,DependencyPending,NarrowWindow,DENIED,DATA_ROOT,stamp,secret
 
 RETRY_SECONDS=30
+class DirectoryUnavailable(ValueError):pass
 
 class Store(BaseStore):
     def __init__(self,root):
@@ -16,6 +17,9 @@ class Store(BaseStore):
             db.execute('PRAGMA journal_mode=WAL')
             db.execute('CREATE TABLE IF NOT EXISTS job_delays(job TEXT PRIMARY KEY,not_before REAL)')
             db.execute('CREATE TABLE IF NOT EXISTS job_channels(job TEXT,channel TEXT,PRIMARY KEY(job,channel))')
+            if 'block_reason' not in {r[1] for r in db.execute('PRAGMA table_info(jobs)')}:
+                db.execute("ALTER TABLE jobs ADD COLUMN block_reason TEXT NOT NULL DEFAULT ''")
+                db.execute("UPDATE jobs SET block_reason=CASE WHEN error LIKE '%；前置目录不可用：%' THEN 'dependency' ELSE 'validation' END WHERE status='blocked'")
         if os.name=='posix':self.root.chmod(0o700);self.path.chmod(0o600)
 
 class Engine(BaseEngine):
@@ -31,7 +35,22 @@ class Engine(BaseEngine):
                     db.execute("UPDATE jobs SET status='excluded',error='Linux版排除独立权限接口' WHERE id=?",(entry['id'],))
     def plan(self,ident,*args,**kwargs):
         if self.catalog.get(ident,{}).get('independent'):raise ValueError('Linux版不采集需要独立权限的接口')
-        return super().plan(ident,*args,**kwargs)
+        result=super().plan(ident,*args,**kwargs)
+        with self.store.db() as db:
+            p=json.loads(db.execute('SELECT plan FROM jobs WHERE id=?',(ident,)).fetchone()['plan'])
+            p['dependencies']=self.dependencies(p)
+            db.execute("UPDATE jobs SET plan=?,block_reason='' WHERE id=?",(json.dumps(p),ident))
+        return result
+    def update(self,ident,end=None):
+        super().update(ident,end)
+        with self.store.db() as db:db.execute("UPDATE jobs SET block_reason='' WHERE id=?",(ident,))
+    @staticmethod
+    def dependencies(plan):
+        return sorted(set(plan.get('dependencies',[]))|{v['$catalog'] for v in plan.get('params',{}).values() if isinstance(v,dict) and '$catalog' in v})
+    def block_dependency(self,j,message):
+        if j['status']=='blocked' and j.get('block_reason')=='dependency' and j['error']==message:return
+        with self.store.db() as db:db.execute("UPDATE jobs SET status='blocked',error=?,block_reason='dependency' WHERE id=?",(message,j['id']))
+        self.store.log('目录依赖受阻，其他项目继续：'+j['title']+'；'+message)
     def catalog_values(self,source,field):
         rows=self.store.rows('SELECT status FROM jobs WHERE id=?',(source,))
         if not rows or rows[0]['status']!='complete':raise DependencyPending('等待目录完成：'+source)
@@ -47,7 +66,7 @@ class Engine(BaseEngine):
             d=json.loads(content)
             if field not in d['fields']:raise ValueError('目录缺少字段：'+source+'.'+field)
             index=d['fields'].index(field);values.update(str(r[index]) for r in d['items'] if r[index] is not None and str(r[index]))
-        if not values:raise DependencyPending('目录没有可用代码，需核对：'+source)
+        if not values:raise DirectoryUnavailable('目录已完成但没有可用代码，关联任务受阻：'+source)
         return sorted(values)
     def channel_for(self,api):
         if self.catalog[api].get('independent'):raise ValueError('独立权限接口禁止派发')
@@ -83,7 +102,7 @@ class Engine(BaseEngine):
                 if not rows or self.catalog[ident].get('independent') or json.loads(rows[0]['plan']).get('bulk_placeholder'):raise ValueError('任务不存在或被排除，请先建立可执行计划')
                 if rows[0]['status']=='complete':raise ValueError('请先更新已完成项目的日期范围')
                 with self.store.db() as db:
-                    db.execute("UPDATE jobs SET status='pending',error='' WHERE id=?",(ident,))
+                    db.execute("UPDATE jobs SET status='pending',error='',block_reason='' WHERE id=?",(ident,))
                     db.execute('DELETE FROM retries WHERE job=?',(ident,))
                     db.execute('DELETE FROM job_channels WHERE job=?',(ident,))
             self.selected=ident;self.active=True;self.phase='running'
@@ -112,9 +131,10 @@ class Engine(BaseEngine):
             if self.selected and ident!=self.selected or ident in self.busy.values():continue
             entry=self.catalog[ident];p=json.loads(j['plan'])
             if j['status']=='blocked':
-                deps=p.get('dependencies',[])
-                states={r['id']:r['status'] for r in self.store.rows('SELECT id,status FROM jobs')}
-                if not deps or not all(states.get(d)=='complete' for d in deps):continue
+                if j.get('block_reason')!='dependency':continue
+                deps=self.dependencies(p)
+                states={r['id']:r for r in self.store.rows('SELECT id,status,records FROM jobs')}
+                if not deps or not all(d in states and states[d]['status']=='complete' and states[d]['records']>0 for d in deps):continue
             if entry.get('independent') or entry.get('excluded') or ident in DENIED:
                 with self.store.db() as db:db.execute("UPDATE jobs SET status='excluded',error='排除独立权限或本地重复接口' WHERE id=?",(ident,))
                 continue
@@ -123,16 +143,24 @@ class Engine(BaseEngine):
             deferred=self.store.rows('SELECT not_before FROM job_delays WHERE job=?',(ident,))
             if deferred and deferred[0]['not_before']>time.time():continue
             try:args,p,c=self.request_params(j)
+            except DirectoryUnavailable as exc:
+                self.block_dependency(j,str(exc));continue
             except DependencyPending as exc:
-                dependencies=p.get('dependencies',[])
+                dependencies=self.dependencies(p)
                 states={r['id']:r['status'] for r in self.store.rows('SELECT id,status FROM jobs')}
-                dead=[d for d in dependencies if states.get(d) in ('excluded','unavailable','blocked')]
-                with self.store.db() as db:db.execute('UPDATE jobs SET status=?,error=? WHERE id=?',('blocked' if dead else 'waiting',str(exc)+('；前置目录不可用：'+','.join(dead) if dead else ''),ident))
+                dead=[d for d in dependencies if d not in states or states[d] in ('excluded','unavailable','blocked')]
+                if dead:self.block_dependency(j,str(exc)+'；前置目录不可用：'+','.join(dead))
+                else:
+                    with self.store.db() as db:db.execute("UPDATE jobs SET status='waiting',error=?,block_reason='' WHERE id=?",(str(exc),ident))
                 continue
             except (ValueError,KeyError,OSError) as exc:
                 self.fail(j,exc);continue
             if args is None:
                 self.fail(j,ValueError('断点与计划范围不一致，需核验'));continue
+            if j['status']=='blocked':
+                # A repaired dependency is runnable even while its quota is cooling.
+                # settle() must keep the queue alive until that future request is due.
+                with self.store.db() as db:db.execute("UPDATE jobs SET status='pending',error='',block_reason='' WHERE id=?",(ident,))
             fingerprint=hashlib.sha256(json.dumps([ident,args,entry['fields']],sort_keys=True).encode()).hexdigest()
             retry=self.store.rows('SELECT * FROM retries WHERE job=? AND request_key=?',(ident,fingerprint))
             attempts=retry[0]['attempts'] if retry else 0
@@ -144,7 +172,7 @@ class Engine(BaseEngine):
                 db.execute('INSERT INTO requests VALUES(?,?)',(now,ident))
                 db.execute('DELETE FROM requests WHERE time<?',(now-86400,))
                 db.execute('INSERT OR REPLACE INTO retries VALUES(?,?,?,?,?)',(ident,fingerprint,attempts+1,now+RETRY_SECONDS,''))
-                db.execute("UPDATE jobs SET status='pending',error='' WHERE id=?",(ident,))
+                db.execute("UPDATE jobs SET status='pending',error='',block_reason='' WHERE id=?",(ident,))
             self.store.set('next_due',now+max(60/min(400,self.store.get('rpm',400)),self.store.get('proxy_gap',0)))
             self.busy[channel]=ident;self.current=','.join(self.busy.values());self.next_job=ident
             return j,args,p,c,attempts+1
@@ -177,7 +205,7 @@ class Engine(BaseEngine):
         if isinstance(exc,OSError):transient=True
         status='retry' if transient else 'blocked' if isinstance(exc,ValueError) else 'unavailable'
         with self.store.db() as db:
-            db.execute('UPDATE jobs SET status=?,error=? WHERE id=?',(status,message,j['id']))
+            db.execute('UPDATE jobs SET status=?,error=?,block_reason=? WHERE id=?',(status,message,'validation' if status=='blocked' else '',j['id']))
             db.execute('UPDATE retries SET not_before=?,last_error=? WHERE job=?',(time.time()+delay,message,j['id']))
             if transient:db.execute('INSERT OR REPLACE INTO job_delays VALUES(?,?)',(j['id'],time.time()+delay))
         self.store.log(('任务等待至少'+str(delay)+'秒重试' if transient else '任务已隔离为'+status)+'，其他可执行项目继续：'+j['title']+'；'+message)

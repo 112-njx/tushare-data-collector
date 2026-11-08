@@ -148,5 +148,54 @@ class LinuxTests(unittest.TestCase):
         now=time.time()
         with self.store.db() as db:db.executemany('INSERT INTO requests VALUES(?,?)',[(now,'a')]*400)
         self.assertGreater(self.engine.due('b',400),now+59)
+    def dependent_plan(self):
+        detail=dict(ENTRY,id='detail',title='目录依赖数据',inputs=[dict(name='ts_code',required=True)])
+        self.engine.catalog['detail']=detail
+        self.engine.plan('detail',{'ts_code':{'$catalog':'a','field':'ts_code'}},'20200101','20200101','snapshot','',True)
+    def seed_directory(self,codes):
+        self.plan();j=self.job();args,p,c=self.engine.request_params(j)
+        self.engine.accept(j,args,p,c,dict(fields=['ts_code'],items=[[v] for v in codes]))
+    def test_validation_block_with_completed_dependency_is_not_retried(self):
+        self.seed_directory(['000001.SZ']);self.plan('b');self.dependent_plan();calls=[]
+        def fetch(api,*args):
+            calls.append(api)
+            return dict(fields=['id'],items=[[1,2]] if api=='detail' else [[1]])
+        self.engine.transport=fetch;self.run_all()
+        self.assertEqual(calls.count('detail'),1);self.assertEqual(self.job('detail')['block_reason'],'validation')
+        self.assertEqual(self.job('b')['status'],'complete')
+        self.engine.start();self.wait(lambda:not self.engine.active)
+        self.assertEqual(calls.count('detail'),1)
+    def test_empty_completed_directory_blocks_dependents_and_finishes(self):
+        self.seed_directory([]);self.dependent_plan();calls=[]
+        self.engine.transport=lambda *args:calls.append(args)
+        self.run_all()
+        self.assertEqual(calls,[]);self.assertEqual(self.job()['status'],'complete')
+        self.assertEqual(self.job('detail')['status'],'blocked');self.assertEqual(self.job('detail')['block_reason'],'dependency')
+        self.assertEqual(self.engine.phase,'finished')
+    def test_dependency_block_recovers_when_directory_is_repaired(self):
+        self.seed_directory([]);self.dependent_plan();self.run_all()
+        self.engine.update('a');calls=[]
+        def fetch(api,*args):
+            calls.append(api)
+            return dict(fields=['ts_code'],items=[['000001.SZ']]) if api=='a' else dict(fields=['id'],items=[[1]])
+        self.engine.transport=fetch;self.engine.start();self.wait(lambda:not self.engine.active and not self.engine.current)
+        self.assertEqual(calls,['a','detail']);self.assertEqual(self.job('detail')['status'],'complete')
+    def test_validation_isolation_survives_restart(self):
+        self.seed_directory(['000001.SZ']);self.dependent_plan()
+        self.engine.local.channel='main';self.engine.fail(self.job('detail'),ValueError('无法可靠分页'))
+        other=Engine(Store(self.root/'状态'),list(self.engine.catalog.values()),data_root=self.root/'mydb/Tushare')
+        other.start()
+        with other.guard:claim=other.prepare('main')
+        self.assertIsNone(claim);self.assertFalse(other.active)
+        self.assertEqual(self.job('detail')['block_reason'],'validation')
+    def test_legacy_blocked_rows_are_migrated_conservatively(self):
+        from core import Store as LegacyStore
+        old=LegacyStore(self.root/'旧状态')
+        with old.db() as db:
+            db.execute('INSERT INTO jobs(id,status,error) VALUES(?,?,?)',('check','blocked','返回行列不一致'))
+            db.execute('INSERT INTO jobs(id,status,error) VALUES(?,?,?)',('dep','blocked','等待目录；前置目录不可用：a'))
+        migrated=Store(self.root/'旧状态')
+        self.assertEqual(migrated.rows("SELECT block_reason FROM jobs WHERE id='check'")[0]['block_reason'],'validation')
+        self.assertEqual(migrated.rows("SELECT block_reason FROM jobs WHERE id='dep'")[0]['block_reason'],'dependency')
 
 if __name__=='__main__':unittest.main()
