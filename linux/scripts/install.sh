@@ -18,7 +18,7 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-WorkingDirectory="$ROOT"
+WorkingDirectory=$ROOT
 ExecStart="$BIN" --no-browser
 Environment="COLLECTOR_HOME=$ROOT"
 Environment=COLLECTOR_PORT=18794
@@ -38,5 +38,6 @@ ReadWritePaths="$ROOT/状态" "$ROOT/mydb"
 WantedBy=multi-user.target
 EOF
 systemctl daemon-reload
+systemd-analyze verify /etc/systemd/system/tushare-collector.service
 systemctl enable tushare-collector.service
 echo '服务已安装且开机启用，尚未启动。下一步：bash scripts/configure.sh，然后 bash scripts/start.sh。'
