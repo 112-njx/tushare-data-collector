@@ -8,6 +8,7 @@ from pathlib import Path
 from core import Engine as BaseEngine,Store as BaseStore,CredentialError,RemoteError,DependencyPending,NarrowWindow,DENIED,DATA_ROOT,stamp,secret
 
 from history import latest,floor,previous,reverse_dates
+from providers import routed_ids,financial,import_coverage,page_key,DATAHUB_URL
 
 RETRY_SECONDS=30
 class DirectoryUnavailable(ValueError):pass
@@ -16,6 +17,8 @@ class Store(BaseStore):
     def __init__(self,root):
         super().__init__(root)
         with self.db() as db:
+            if 'channel' not in {r[1] for r in db.execute('PRAGMA table_info(events)')}:
+                db.execute("ALTER TABLE events ADD COLUMN channel TEXT NOT NULL DEFAULT 'original'")
             db.execute('PRAGMA journal_mode=WAL')
             db.execute('CREATE TABLE IF NOT EXISTS job_delays(job TEXT PRIMARY KEY,not_before REAL)')
             db.execute('CREATE TABLE IF NOT EXISTS job_channels(job TEXT,channel TEXT,PRIMARY KEY(job,channel))')
@@ -23,6 +26,11 @@ class Store(BaseStore):
                 db.execute("ALTER TABLE jobs ADD COLUMN block_reason TEXT NOT NULL DEFAULT ''")
                 db.execute("UPDATE jobs SET block_reason=CASE WHEN error LIKE '%；前置目录不可用：%' THEN 'dependency' ELSE 'validation' END WHERE status='blocked'")
         if os.name=='posix':self.root.chmod(0o700);self.path.chmod(0o600)
+    def log(self,message):
+        channel='datahub' if threading.current_thread().name=='采集-datahub' else 'original'
+        with self.db() as db:
+            db.execute('INSERT INTO events(time,message,channel) VALUES(?,?,?)',(stamp(),message,channel))
+            db.execute('DELETE FROM events WHERE channel=? AND id NOT IN (SELECT id FROM events WHERE channel=? ORDER BY id DESC LIMIT 3000)',(channel,channel))
 
 class Engine(BaseEngine):
     def __init__(self,store,catalog,transport=None,data_root=DATA_ROOT):
@@ -30,12 +38,38 @@ class Engine(BaseEngine):
         self.local=threading.local();self.busy={};self.workers=[]
         self.thread=threading.Thread(target=self.supervise,name='采集调度器',daemon=True)
         self.phase='paused';self.calendar_cache=None
+        self.datahub_ids=routed_ids(catalog)
+        import_coverage(store,store.root.parent)
         for job in store.rows('SELECT * FROM jobs'):self.reverse_job(job)
         # Old or manually imported plans cannot override the hard exclusion.
         with store.db() as db:
             for entry in self.catalog.values():
-                if entry.get('independent'):
-                    db.execute("UPDATE jobs SET status='excluded',error='Linux版排除独立权限接口' WHERE id=?",(entry['id'],))
+                if entry.get('independent') or financial(entry):
+                    db.execute("UPDATE jobs SET status='excluded',error=? WHERE id=?",('排除上市公司财务数据' if financial(entry) else 'Linux版排除独立权限接口',entry['id']))
+            # Provider errors from the old supplier must not disable the new route.
+            if not store.get('datahub_routing_v1'):
+                for ident in self.datahub_ids:
+                    if financial(self.catalog[ident]):continue
+                    db.execute("UPDATE jobs SET status='pending',error='' WHERE id=? AND status='unavailable'",(ident,))
+                    db.execute('DELETE FROM job_channels WHERE job=?',(ident,))
+        store.set('datahub_routing_v1',True)
+    def provider(self,ident):return 'datahub' if ident in self.datahub_ids else 'original'
+    def quota_key(self,ident):return 'datahub_next_due' if ident in self.datahub_ids else 'next_due'
+    def due(self,api,rpm):
+        now=time.time();provider=self.provider(api)
+        history=[r for r in self.store.rows('SELECT time,api FROM requests WHERE time>? ORDER BY time',(now-60,)) if self.provider(r['api'])==provider]
+        limit=min(1000,max(1,self.store.get('datahub_rpm',800))) if provider=='datahub' else min(400,self.store.get('rpm',400))
+        due=max(now,self.store.get(self.quota_key(api),0))
+        if len(history)>=limit:due=max(due,history[-limit]['time']+60.1)
+        same=[r for r in history if r['api']==api]
+        if len(same)>=rpm:due=max(due,same[-rpm]['time']+60.1)
+        return due
+    def redact(self,message):
+        message=super().redact(message);encoded=self.store.get('datahub_account')
+        if encoded:
+            try:message=message.replace(secret(encoded,True),'[已隐藏Token]')
+            except Exception:pass
+        return message
     def reverse_job(self,j,fresh=False):
         p=json.loads(j['plan']);c=json.loads(j['cursor'])
         if p.get('bulk_placeholder') or p.get('mode')=='snapshot' or p.get('direction')=='desc' or j['status'] in ('complete','excluded'):return j
@@ -111,6 +145,49 @@ class Engine(BaseEngine):
                     if len(value)==8 and value.isdigit():found.append(value)
         return min(found) if found else None
     def request_params(self,j):
+        # Local coverage is additive; cloud cursors are never replaced by an older snapshot.
+        for _ in range(10000):
+            args,p,c=self._request_params(j)
+            if args is None:return args,p,c
+            hit=self.store.rows('SELECT * FROM local_pages WHERE api=? AND params=?',(j['id'],page_key(args)))
+            from baseline import canonical
+            scopes=self.store.rows('SELECT scope FROM coverage_scopes WHERE api=?',(j['id'],))
+            matching=scopes and scopes[0]['scope']==canonical(p.get('resolved_params',p['params'])).decode()
+            intervals=self.store.rows('SELECT start,end FROM local_intervals WHERE api=? AND variant=?',(j['id'],c['variant'])) if matching and p['mode'] in ('day','range') else []
+            covered=next((x for x in intervals if x['start']<=c['date']<=x['end']),None)
+            if not hit and not covered:
+                if p['mode']=='range' and p.get('direction')=='desc':
+                    import datetime as dt
+                    start=args.get(p['schema']['key'],c['date'])
+                    overlap=[x for x in intervals if start<=x['end']<c['date']]
+                    if overlap:
+                        c['window_days']=(dt.datetime.strptime(c['date'],'%Y%m%d')-dt.datetime.strptime(max(x['end'] for x in overlap),'%Y%m%d')).days
+                        with self.store.db() as db:db.execute('UPDATE jobs SET cursor=? WHERE id=?',(json.dumps(c),j['id']))
+                        j=dict(j,cursor=json.dumps(c));continue
+                return args,p,c
+            from history import reverse_advance
+            from core import next_date
+            cursor=dict(c)
+            if hit and hit[0]['n']>=p['cap']:
+                if not p['offset']:raise ValueError('本地已保存页达到上限但不支持分页，请核验')
+                cursor.update(offset=c['offset']+hit[0]['n'],previous=hit[0]['digest'])
+            elif p['mode']=='snapshot':cursor.update(variant=c['variant']+1,offset=0,previous='')
+            elif p.get('direction')=='desc':
+                if covered:
+                    c=dict(c,date=covered['start']);args=dict(args)
+                    if p['mode']=='range':args[p['schema']['key']]=covered['start']
+                cursor=reverse_advance(p,c,args)
+            else:
+                cursor.update(date=next_date(covered['end'] if covered else c['date'],p['mode']),offset=0,previous='')
+                if cursor['date']>p['end']:cursor.update(variant=c['variant']+1,date=p['start'])
+            total=1
+            for v in p.get('resolved_params',p['params']).values():total*=len(v) if isinstance(v,list) else 1
+            status='complete' if cursor['variant']>=total else 'pending'
+            with self.store.db() as db:db.execute("UPDATE jobs SET cursor=?,status=?,error='' WHERE id=?",(json.dumps(cursor),status,j['id']))
+            if status=='complete':return None,p,cursor
+            j=dict(j,cursor=json.dumps(cursor),status=status)
+        raise ValueError('本地覆盖断点推进过多，需核验')
+    def _request_params(self,j):
         p=json.loads(j['plan']);c=json.loads(j['cursor'])
         if p.get('direction')=='desc' and p['mode']=='day' and p['key']=='trade_date' and not c.get('offset'):
             closed=self.closed_days();exchanges=[];params=p.get('resolved_params',p['params']);code=params.get('ts_code')
@@ -134,6 +211,7 @@ class Engine(BaseEngine):
                 reverse_dates(args,p,c)
         return args,p,c
     def plan(self,ident,*args,**kwargs):
+        if financial(self.catalog.get(ident,{'id':ident})):raise ValueError('上市公司财务数据已排除，不再采集')
         if self.catalog.get(ident,{}).get('independent'):raise ValueError('Linux版不采集需要独立权限的接口')
         before=self.store.rows('SELECT * FROM jobs WHERE id=?',(ident,))
         if before:
@@ -186,10 +264,15 @@ class Engine(BaseEngine):
         if not values:raise DirectoryUnavailable('目录已完成但没有可用代码，关联任务受阻：'+source)
         return sorted(values)
     def channel_for(self,api):
+        if financial(self.catalog[api]):raise ValueError('上市公司财务数据禁止派发')
         if self.catalog[api].get('independent'):raise ValueError('独立权限接口禁止派发')
+        if api in self.datahub_ids:return 'datahub'
         return getattr(self.local,'channel',None) or super().channel_for(api)
     def http(self,api,params,fields):
         channel=self.channel_for(api)
+        if channel=='datahub':
+            from datahub import fetch
+            return fetch(self,api,params,fields)
         try:secret(self.store.get('account' if channel=='main' else 'backup_account',''),True)
         except Exception:raise CredentialError('本机Token无法解密，请恢复密钥或重新配置凭据') from None
         return super().http(api,params,fields)
@@ -213,10 +296,10 @@ class Engine(BaseEngine):
     def start(self,ident=None):
         with self.guard:
             self.paused()
-            if not any(self.store.get(k) for k in ('account','backup_account')):raise ValueError('请先配置至少一个Token')
+            if not any(self.store.get(k) for k in ('account','backup_account','datahub_account')):raise ValueError('请先配置至少一个Token')
             if ident:
                 rows=self.store.rows('SELECT * FROM jobs WHERE id=?',(ident,))
-                if not rows or self.catalog[ident].get('independent') or json.loads(rows[0]['plan']).get('bulk_placeholder'):raise ValueError('任务不存在或被排除，请先建立可执行计划')
+                if not rows or financial(self.catalog[ident]) or self.catalog[ident].get('independent') or json.loads(rows[0]['plan']).get('bulk_placeholder'):raise ValueError('任务不存在或被排除，请先建立可执行计划')
                 if rows[0]['status']=='complete':raise ValueError('请先更新已完成项目的日期范围')
                 with self.store.db() as db:
                     db.execute("UPDATE jobs SET status='pending',error='',block_reason='' WHERE id=?",(ident,))
@@ -234,17 +317,18 @@ class Engine(BaseEngine):
             try:self.start(self.store.get('resume_selected'))
             except ValueError as exc:self.store.log('启动后等待配置：'+str(exc))
     def supervise(self):
-        self.workers=[threading.Thread(target=self.worker,args=(c,),name='采集-'+c,daemon=True) for c in ('main','backup')]
+        self.workers=[threading.Thread(target=self.worker,args=(c,),name='采集-'+c,daemon=True) for c in ('main','backup','datahub')]
         for worker in self.workers:worker.start()
         for worker in self.workers:worker.join()
     def channel_ready(self,channel):
-        return bool(self.store.get('account' if channel=='main' else 'backup_account')) and channel not in self.store.get('channel_health',{})
+        return bool(self.store.get({'main':'account','backup':'backup_account','datahub':'datahub_account'}[channel])) and channel not in self.store.get('channel_health',{})
     def prepare(self,channel):
         """Called under guard: claim and quota reservation are a single critical section."""
         if not self.active or self.closing or not self.channel_ready(channel):return None
         rows=self.store.rows("SELECT * FROM jobs WHERE status IN ('pending','retry','waiting','failed','blocked') ORDER BY priority,rowid")
         for j in rows:
             ident=j['id']
+            if (channel=='datahub')!=(ident in self.datahub_ids):continue
             if self.selected and ident!=self.selected or ident in self.busy.values():continue
             j=self.reverse_job(j)
             entry=self.catalog[ident];p=json.loads(j['plan'])
@@ -253,10 +337,10 @@ class Engine(BaseEngine):
                 deps=self.dependencies(p)
                 states={r['id']:r for r in self.store.rows('SELECT id,status,records FROM jobs')}
                 if not deps or not all(d in states and states[d]['status']=='complete' and states[d]['records']>0 for d in deps):continue
-            if entry.get('independent') or entry.get('excluded') or ident in DENIED:
+            if financial(entry) or entry.get('independent') or entry.get('excluded') or ident in DENIED:
                 with self.store.db() as db:db.execute("UPDATE jobs SET status='excluded',error='排除独立权限或本地重复接口' WHERE id=?",(ident,))
                 continue
-            if p.get('channel','auto') not in ('auto',channel):continue
+            if channel!='datahub' and p.get('channel','auto') not in ('auto',channel):continue
             if self.store.rows('SELECT 1 FROM job_channels WHERE job=? AND channel=?',(ident,channel)):continue
             deferred=self.store.rows('SELECT not_before FROM job_delays WHERE job=?',(ident,))
             if deferred and deferred[0]['not_before']>time.time():continue
@@ -274,16 +358,17 @@ class Engine(BaseEngine):
             except (ValueError,KeyError,OSError) as exc:
                 self.fail(j,exc);continue
             if args is None:
+                if self.store.rows('SELECT status FROM jobs WHERE id=?',(ident,))[0]['status']=='complete':continue
                 self.fail(j,ValueError('断点与计划范围不一致，需核验'));continue
             if j['status']=='blocked':
                 # A repaired dependency is runnable even while its quota is cooling.
                 # settle() must keep the queue alive until that future request is due.
                 with self.store.db() as db:db.execute("UPDATE jobs SET status='pending',error='',block_reason='' WHERE id=?",(ident,))
-            if self.store.get('next_due',0)>time.time():return None
+            if self.store.get(self.quota_key(ident),0)>time.time():return None
             fingerprint=hashlib.sha256(json.dumps([ident,args,entry['fields']],sort_keys=True).encode()).hexdigest()
             retry=self.store.rows('SELECT * FROM retries WHERE job=? AND request_key=?',(ident,fingerprint))
             attempts=retry[0]['attempts'] if retry else 0
-            due=self.due(ident,min(400,entry.get('rpm',30)))
+            due=self.due(ident,min(1000 if channel=='datahub' else 400,entry.get('rpm',30)))
             if retry:due=max(due,retry[0]['not_before'])
             if due>time.time():continue
             now=time.time()
@@ -292,7 +377,8 @@ class Engine(BaseEngine):
                 db.execute('DELETE FROM requests WHERE time<?',(now-86400,))
                 db.execute('INSERT OR REPLACE INTO retries VALUES(?,?,?,?,?)',(ident,fingerprint,attempts+1,now+RETRY_SECONDS,''))
                 db.execute("UPDATE jobs SET status='pending',error='',block_reason='' WHERE id=?",(ident,))
-            self.store.set('next_due',now+max(60/min(400,self.store.get('rpm',400)),self.store.get('proxy_gap',0)))
+            limit=min(1000,max(1,self.store.get('datahub_rpm',800))) if channel=='datahub' else min(400,self.store.get('rpm',400))
+            self.store.set(self.quota_key(ident),now+max(60/limit,self.store.get('datahub_gap' if channel=='datahub' else 'proxy_gap',0)))
             self.busy[channel]=ident;self.current=','.join(self.busy.values());self.next_job=ident
             return j,args,p,c,attempts+1
         self.settle()
@@ -302,7 +388,7 @@ class Engine(BaseEngine):
         jobs=self.store.rows('SELECT * FROM jobs')
         pending=[j for j in jobs if (not self.selected or j['id']==self.selected) and j['status'] in ('pending','retry','waiting','failed')]
         if pending:
-            self.phase='waiting' if any(self.channel_ready(c) for c in ('main','backup')) else 'waiting_credentials'
+            self.phase='waiting' if any(self.channel_ready(c) for c in ('main','backup','datahub')) else 'waiting_credentials'
             return
         self.active=False;self.phase='finished';self.store.set('resume_requested',False)
         self.store.log('本轮已结束：可执行项目已走完，排除/不可用/覆盖待核验项目另列；不代表上游绝对完整')
@@ -317,10 +403,13 @@ class Engine(BaseEngine):
             with self.store.db() as db:db.execute('INSERT OR IGNORE INTO job_channels VALUES(?,?)',(j['id'],channel))
             denied={r['channel'] for r in self.store.rows('SELECT channel FROM job_channels WHERE job=?',(j['id'],))}
             preferred=json.loads(j['plan']).get('channel','auto')
-            transient=any(c not in denied and self.channel_ready(c) and preferred in ('auto',c) for c in ('main','backup'))
+            transient=False if channel=='datahub' else any(c not in denied and self.channel_ready(c) and preferred in ('auto',c) for c in ('main','backup'))
+        if channel=='datahub' and getattr(exc,'provider_limited',False):
+            self.store.set('datahub_next_due',max(self.store.get('datahub_next_due',0),time.time()+delay))
         if getattr(exc,'ip_limited',False):
-            self.store.set('proxy_gap',max(self.store.get('proxy_gap',0),delay))
-            self.store.set('next_due',max(self.store.get('next_due',0),time.time()+delay))
+            gap='datahub_gap' if channel=='datahub' else 'proxy_gap';key=self.quota_key(j['id'])
+            self.store.set(gap,max(self.store.get(gap,0),delay))
+            self.store.set(key,max(self.store.get(key,0),time.time()+delay))
         if isinstance(exc,OSError):transient=True
         status='retry' if transient else 'blocked' if isinstance(exc,ValueError) else 'unavailable'
         with self.store.db() as db:
@@ -365,6 +454,15 @@ class Engine(BaseEngine):
     def status(self):
         with self.guard:
             value=super().status()
-            if self.active and not self.busy and not any(self.channel_ready(c) for c in ('main','backup')):self.phase='waiting_credentials'
+            if self.active and not any(self.channel_ready(c) for c in ('main','backup','datahub')):self.phase='waiting_credentials'
+            value['events']=self.store.rows("SELECT time,message FROM events WHERE channel='original' ORDER BY id DESC LIMIT 80")
+            value['datahub_configured']=bool(self.store.get('datahub_account'))
+            value['datahub_rpm']=self.store.get('datahub_rpm',800)
+            value['datahub_next_due']=self.store.get('datahub_next_due',0)
+            local_counts={r['api']:r for r in self.store.rows('SELECT api,COUNT(*) AS batches,SUM(n) AS records FROM local_pages GROUP BY api')}
+            for job in value['jobs']:
+                job['provider']=self.provider(job['id'])
+                job['local_records']=local_counts.get(job['id'],{}).get('records',0)
+                job['local_batches']=local_counts.get(job['id'],{}).get('batches',0)
             value.update(platform='Ubuntu 24.04 x86_64',workers=dict(self.busy),phase=self.phase,retry_seconds=RETRY_SECONDS,channel_health=self.store.get('channel_health',{}),resume_requested=self.store.get('resume_requested',False),baseline=self.store.get('baseline'))
             return value

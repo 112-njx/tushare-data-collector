@@ -29,6 +29,10 @@ for entry in value['catalog_files']:
     target=dest/entry['relative_path'];target.parent.mkdir(parents=True,exist_ok=True);shutil.copy2(f,target)
 PY
 fi
+if [[ "${COLLECTOR_PACKAGE_BASELINE:-1}" == 1 && -f 基线/本地增量覆盖.json ]]; then
+    mkdir -p "$stage/基线"
+    cp 基线/本地增量覆盖.json "$stage/基线/"
+fi
 chmod +x "$stage"/scripts/*.sh "$stage/Tushare数据采集器_linux/采集器"
 "$stage/Tushare数据采集器_linux/采集器" --version
 # No credentials, states, data or local browser profiles are copied into the archive.

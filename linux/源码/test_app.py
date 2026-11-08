@@ -402,9 +402,9 @@ class Tests(unittest.TestCase):
             db.execute("UPDATE jobs SET plan=?,status='complete' WHERE id='hk_basic'",(json.dumps(p),))
             db.execute("UPDATE jobs SET plan=?,status='complete' WHERE id='hk_income'",(json.dumps(q),))
         build(self.engine,'20200101','20200101')
-        self.assertEqual(self.job('hk_income')['status'],'pending')
-        self.assertNotIn('resolved_params',json.loads(self.job('hk_income')['plan']))
-        self.assertEqual(json.loads(self.job('hk_income')['cursor'])['variant'],0)
+        self.assertEqual(self.job('hk_income')['status'],'excluded')
+        self.assertEqual(json.loads(self.job('hk_income')['plan']),q)
+        self.assertEqual(json.loads(self.job('hk_income')['cursor']),{})
     def test_empty_snapshot_never_creates_data_file(self):
         self.engine.catalog['demo']['inputs']=[]
         self.engine.plan('demo',{},'20200101','20200101','snapshot','',True)

@@ -61,9 +61,15 @@ def main(open_browser=True):
         def do_GET(self):
             if self.headers.get('Host') not in hosts:self.send({'error':'无效访问地址'},403);return
             if self.path=='/':self.send(HTML,html=True);return
+            if self.path=='/datahub-logs':
+                from datahub import LOG_HTML
+                self.send(LOG_HTML,html=True);return
             if not self.auth():self.send({'error':'访问令牌无效，请使用启动时打开的完整地址'},403);return
             try:
                 if self.path=='/api/status':self.send(engine.status())
+                elif self.path=='/api/datahub-logs':
+                    state=engine.status();jobs=[j for j in state['jobs'] if j['provider']=='datahub']
+                    self.send(dict(state='DataHubCo：'+('已配置' if state['datahub_configured'] else '未配置')+'；当前 '+str(state['workers'].get('datahub','等待'))+'；已完成 '+str(sum(j['status']=='complete' for j in jobs))+'/'+str(len(jobs))+'；上限 '+str(state['datahub_rpm'])+'/分钟',events=store.rows("SELECT time,message FROM events WHERE channel='datahub' ORDER BY id DESC LIMIT 200")))
                 elif self.path=='/api/catalog':self.send(catalog)
                 elif self.path.startswith('/api/preview?'):
                     key=urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get('key',[''])[0]
@@ -92,7 +98,19 @@ def main(open_browser=True):
                     elif action=='shutdown':engine.pause();engine.closing=True;engine.wake.set()
                     else:
                         engine.paused()
-                        if action=='account':
+                        if action=='datahub-account':
+                            from providers import DATAHUB_URL
+                            t=v.get('token','').strip();rpm=v.get('rpm',800)
+                            if type(rpm) is not int or not 1<=rpm<=1000:raise ValueError('DataHubCo上限为1至1000次/分钟')
+                            if t and not 16<=len(t)<=1024:raise ValueError('DataHubCo Token格式不完整')
+                            if t:
+                                store.set('datahub_account',secret(t))
+                                health=store.get('channel_health',{});health.pop('datahub',None);store.set('channel_health',health)
+                                with store.db() as db:
+                                    db.execute("UPDATE jobs SET status='pending',error='' WHERE status='unavailable' AND id IN (SELECT job FROM job_channels WHERE channel='datahub')")
+                                    db.execute("DELETE FROM job_channels WHERE channel='datahub'")
+                            store.set('datahub_rpm',rpm)
+                        elif action=='account':
                             t=v.get('token','').strip()
                             backup=v.get('backup_token','').strip()
                             address=proxy_address(v.get('url',PROXY_URL));default=v.get('default_channel','main')
@@ -138,7 +156,13 @@ def main(open_browser=True):
 
 if __name__=='__main__':
     os.umask(0o077)
-    if '--version' in sys.argv:print('Tushare Linux Collector 1.0 · Ubuntu 24.04 x86_64')
+    if '--version' in sys.argv:print('Tushare Linux Collector 1.1 · Ubuntu 24.04 x86_64 · DataHubCo')
+    elif '--configure-datahub' in sys.argv:
+        t=sys.stdin.readline().strip()
+        if not 16<=len(t)<=1024:raise ValueError('DataHubCo Token格式不完整')
+        store=Store(ROOT/'状态');store.set('datahub_account',secret(t));store.set('datahub_rpm',800)
+        health=store.get('channel_health',{});health.pop('datahub',None);store.set('channel_health',health)
+        print('DataHubCo凭据已加密配置，未发出数据请求')
     elif '--configure' in sys.argv:
         from manage import configure
         configure(ROOT)
