@@ -22,7 +22,8 @@ ASSETS=Path(getattr(sys,'_MEIPASS',Path(__file__).parent))
 PORT=int(os.environ.get('COLLECTOR_PORT','18794'))
 
 class Server(ThreadingHTTPServer):
-    allow_reuse_address=False
+    # fcntl service lock prevents duplicate collectors; reuse permits quick Linux restarts.
+    allow_reuse_address=os.name=='posix'
     daemon_threads=True
     def server_bind(self):
         if hasattr(socket,'SO_EXCLUSIVEADDRUSE'):self.socket.setsockopt(socket.SOL_SOCKET,socket.SO_EXCLUSIVEADDRUSE,1)

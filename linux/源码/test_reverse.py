@@ -132,4 +132,31 @@ class ReverseTests(unittest.TestCase):
         with patch.object(self.engine,'due',side_effect=AssertionError('should not inspect a later quota during global wait')):
             self.assertIsNone(self.engine.prepare('main'))
         self.assertEqual(self.store.rows('SELECT * FROM requests'),[])
+    def test_console_port_reopens_after_response_but_live_listener_stays_exclusive(self):
+        import socket
+        import threading
+        from http.server import BaseHTTPRequestHandler
+        from app import Server
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):self.send_response(200);self.end_headers();self.wfile.write(b'ok')
+            def log_message(self,*a):pass
+        server=Server(('127.0.0.1',0),Handler);address=server.server_address
+        worker=threading.Thread(target=server.handle_request);worker.start()
+        with socket.create_connection(address,timeout=2) as client:
+            client.sendall(b'GET / HTTP/1.0\r\nHost: localhost\r\n\r\n')
+            while client.recv(4096):pass
+        worker.join(2);server.server_close()
+        reopened=Server(address,Handler)
+        try:
+            with self.assertRaises(OSError):Server(address,Handler)
+        finally:reopened.server_close()
+    def test_revise_completed_end_retains_prefix(self):
+        self.plan('20200101','20200102','day','trade_date');self.accept(['2']);self.accept(['1'])
+        self.engine.plan('a',{},'20200101','20200104','day','trade_date',True,revise=True)
+        args,p,c=self.engine.request_params(self.job())
+        self.assertEqual(args['trade_date'],'20200104');self.assertEqual(p['ascending_prefix']['date'],'20200102')
+    def test_editing_unfinished_end_requires_explicit_replay(self):
+        self.plan('20200101','20200102','day','trade_date');before=self.job()['cursor']
+        with self.assertRaisesRegex(ValueError,'尚未完成'):self.engine.plan('a',{},'20200101','20200104','day','trade_date',True,revise=True)
+        self.assertEqual(self.job()['cursor'],before)
 if __name__=='__main__':unittest.main()

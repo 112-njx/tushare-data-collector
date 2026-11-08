@@ -132,17 +132,23 @@ class Engine(BaseEngine):
     def plan(self,ident,*args,**kwargs):
         if self.catalog.get(ident,{}).get('independent'):raise ValueError('Linux版不采集需要独立权限的接口')
         before=self.store.rows('SELECT * FROM jobs WHERE id=?',(ident,))
+        if before:
+            prior=json.loads(before[0]['plan']);new_end=kwargs.get('end',args[2] if len(args)>2 else prior.get('end'))
+            if prior.get('direction')=='desc' and before[0]['status']!='complete' and new_end!=prior.get('end') and not kwargs.get('replay'):
+                raise ValueError('倒序历史尚未完成，修改截止日期需明确选择重新核对；直接续采可保留原范围断点')
         result=super().plan(ident,*args,**kwargs)
         with self.store.db() as db:
             p=json.loads(db.execute('SELECT plan FROM jobs WHERE id=?',(ident,)).fetchone()['plan'])
             p['dependencies']=self.dependencies(p)
             db.execute("UPDATE jobs SET plan=?,block_reason='' WHERE id=?",(json.dumps(p),ident))
         row=self.store.rows('SELECT * FROM jobs WHERE id=?',(ident,))[0]
-        if before and json.loads(before[0]['plan']).get('direction')=='desc' and row['cursor']==before[0]['cursor'] and not kwargs.get('replay'):
+        current=json.loads(row['plan']);prior=json.loads(before[0]['plan']) if before else {}
+        replay=not before or kwargs.get('replay') or prior.get('bulk_placeholder') or any(prior.get(k)!=current.get(k) for k in ('params','start','mode','key')) or current.get('end','')<prior.get('end','')
+        if before and prior.get('direction')=='desc' and row['cursor']==before[0]['cursor'] and not replay:
             old=json.loads(before[0]['plan']);p=json.loads(row['plan']);p['direction']='desc'
             if 'ascending_prefix' in old:p['ascending_prefix']=old['ascending_prefix']
             with self.store.db() as db:db.execute('UPDATE jobs SET plan=? WHERE id=?',(json.dumps(p),ident))
-        else:self.reverse_job(row,fresh=True)
+        else:self.reverse_job(row,fresh=bool(replay))
         return result
     @staticmethod
     def dependencies(plan):
