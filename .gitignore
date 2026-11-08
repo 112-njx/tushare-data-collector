@@ -14,6 +14,12 @@
 !/源码/*.py
 !/源码/*.cjs
 !/源码/catalog.json
+!/linux/
+!/linux/**
+/linux/基线/
+/linux/构建临时/
+/linux/*.tar*
+/linux/*.sha256
 **/.env*
 **/*.sqlite*
 **/*.db

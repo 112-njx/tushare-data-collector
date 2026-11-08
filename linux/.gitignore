@@ -1,0 +1,15 @@
+状态/
+基线/
+mydb/
+构建临时/
+构建环境/
+*.tar
+*.tar.gz
+*.sha256
+*.key
+*.sqlite*
+.env*
+__pycache__/
+*.pyc
+*.spec
+Tushare数据采集器_linux/

@@ -1,0 +1,12 @@
+.git
+状态
+基线
+mydb
+构建临时
+构建环境
+*.tar.gz
+*.sha256
+**/__pycache__
+**/*.key
+**/*.sqlite*
+.env*
