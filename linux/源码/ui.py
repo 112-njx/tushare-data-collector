@@ -7,7 +7,7 @@ HTML=r'''<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="vie
 <label>分片方式<select id="mode"><option value="day">逐日</option><option value="range">起止日期逐日分片</option><option value="month">逐月</option><option value="quarter">逐季度报告期</option><option value="year">逐年</option><option value="snapshot">当前快照（不代表全历史）</option></select></label><label>日期参数<select id="dateKey"></select></label><label>历史起始<input id="startDate" type="date" value="1990-01-01"></label><label>截止日期<input id="endDate" type="date"></label>
 <label><input id="allowEmpty" type="checkbox">允许接口成功返回空结果后推进日期（历史非交易日、无事件区间）；错误响应仍暂停</label><label><input id="confirmed" type="checkbox">已确认此项目的独立权限 / 行情范围不与本地重复</label><label id="replayLabel" hidden><input id="replay" type="checkbox">从新范围重新核对（更改请求参数或范围时需勾选；归档和修订前断点保留）</label><button id="plan" class="primary">建立计划（保持暂停）</button><button id="cancelEdit" hidden>取消编辑</button><p class="muted">历史起点需按文档设定，不保证所有接口从1990年起有数据。仅修改空结果规则时保留当前断点；修改请求范围或参数需明确重新核对。达到返回上限而无法可靠分页时暂停，避免漏数据。</p></section>
 <section class="card"><h2>账号与运行设置</h2><p id="account"></p><label>Tushare Token<input id="token" type="password" autocomplete="new-password" style="width:100%" placeholder="请在服务器本机配置Token"></label><button id="saveToken">加密保存Token（不发起请求）</button><label>全局请求上限 / 分钟<input id="rpm" type="number" min="1" max="400" value="400"></label><button id="saveRate">保存限频</button><p class="muted">各接口同时遵守文档中的更低频次；采用保守频次。Token以当前本机密钥加密保存，页面和日志不返回Token。</p><h2>数据与状态位置</h2><p id="paths"></p><p class="notice">通用A股行情、原有个股资金流已排除；其他行情及不同来源资金流需先确认覆盖。独立权限项目不会因15000积分自动获得访问权。软件仅连接Tushare数据服务。</p><p class="muted">首次启动等待配置；开始采集后会持久化运行意愿，服务重启自动续采；手动暂停后重启仍暂停。已完成计划可点“更新至今天”，回查近期修订数据；快照重新获取当前状态，历史快照无法凭空回补。</p></section></div>
-<section class="card"><h2>任务与断点</h2><div class="scroll"><table><thead><tr><th>数据项目</th><th>状态 / 说明</th><th>累计批次 / 返回行数</th><th>断点</th><th>操作</th></tr></thead><tbody id="tasks"></tbody></table></div></section>
+<section class="card"><h2>任务与断点</h2><label><input type="checkbox" id="hideSettledTasks"> 隐藏已完成、已排除和已确认不可用的行</label><p class="muted" id="taskVisibility"></p><div class="scroll"><table><thead><tr><th>数据项目</th><th>状态 / 说明</th><th>累计批次 / 返回行数</th><th>断点</th><th>操作</th></tr></thead><tbody id="tasks"></tbody></table></div></section>
 <section class="card"><h2>最近日志</h2><pre id="logs"></pre></section><section class="card"><h2>云端新增归档与数据预览</h2><p class="muted">归档保留全部字段。预览仅显示所选文件前50行，统计为返回行数，回查可能重复。</p><div class="scroll"><table><thead><tr><th>数据集</th><th>记录</th><th>文件</th><th>操作</th></tr></thead><tbody id="files"></tbody></table></div><pre id="preview"></pre></section></main>
 <style>[hidden]{display:none!important}</style><script>
 const $=id=>document.getElementById(id),token=new URLSearchParams(location.hash.slice(1)).get('token')||'';let entries=[],last=null,entry=null,pending=false;
@@ -53,5 +53,27 @@ $('saveDatahub').onclick=async()=>{await act('datahub-account',{token:$('datahub
 $('datahubLogs').onclick=()=>window.open('/datahub-logs#token='+encodeURIComponent(token),'_blank','noopener');
 const providerPoll=poll;poll=async()=>{await providerPoll();if(!last)return;$('datahubStatus').textContent=(last.datahub_configured?'已加密配置':'等待配置')+'；独立上限 '+last.datahub_rpm+'/分钟；下次请求等待 '+Math.max(0,Math.ceil(last.datahub_next_due-Date.now()/1000))+' 秒';[...$('tasks').rows].forEach((row,i)=>{if(last.jobs[i])row.cells[0].append(document.createTextNode(' ['+(last.jobs[i].provider==='datahub'?'DataHubCo':'原双Token')+']'))})};
 const coveragePoll=poll;poll=async()=>{await coveragePoll();if(!last)return;[...$('tasks').rows].forEach((row,i)=>{const j=last.jobs[i];if(j?.local_batches)row.cells[2].append(document.createTextNode('；本地已保存 '+j.local_batches+'批 / '+j.local_records+'行，已纳入跳过范围'))})};
+const taskFilter = $('hideSettledTasks');
+const taskFilterKey = 'tushare.hideSettledTasks';
+try { taskFilter.checked = localStorage.getItem(taskFilterKey) === '1'; } catch {}
+function applyTaskFilter() {
+    if (!last) return;
+    let hidden = 0;
+    [...$('tasks').rows].forEach((row, index) => {
+        const job = last.jobs[index];
+        const confirmedUnavailable = job.status === 'unavailable'
+            && /\[(?:unknown_api|api_or_ip_policy)\]/i.test(job.error || '');
+        row.hidden = taskFilter.checked
+            && (['complete', 'excluded'].includes(job.status) || confirmedUnavailable);
+        if (row.hidden) hidden++;
+    });
+    $('taskVisibility').textContent = '显示 ' + (last.jobs.length - hidden) + ' / ' + last.jobs.length + ' 项';
+}
+taskFilter.onchange = () => {
+    try { localStorage.setItem(taskFilterKey, taskFilter.checked ? '1' : '0'); } catch {}
+    applyTaskFilter();
+};
+const taskFilterPoll = poll;
+poll = async () => { await taskFilterPoll(); applyTaskFilter(); };
 $('endDate').value=new Date().toLocaleDateString('sv-SE');(async()=>{try{entries=(await api('catalog')).entries;renderSelect();await poll()}catch(e){$('message').textContent=e.message}})();setInterval(poll,2000);
 </script></html>'''
