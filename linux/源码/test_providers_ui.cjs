@@ -33,6 +33,15 @@ const html=name=>execFileSync('py',['-X','utf8','-c',`import sys;sys.path.insert
   await p.waitForFunction(()=>document.querySelector('#taskVisibility').textContent.includes('3 / 7'));
   await p.locator('#hideSettledTasks').uncheck();
   await p.waitForFunction(()=>document.querySelectorAll('#tasks tr:not([hidden])').length===7);
+  const ignore=p.locator('[data-coverage-ignore="coverage"]');
+  await ignore.click();
+  await p.waitForFunction(()=>document.querySelector('#taskVisibility').textContent.includes('2 / 7'));
+  await p.reload();
+  await p.waitForFunction(()=>document.querySelector('#taskVisibility').textContent.includes('2 / 7'));
+  await p.locator('#hideSettledTasks').uncheck();
+  await ignore.filter({hasText:'取消忽略'}).click();
+  await p.locator('#hideSettledTasks').check();
+  await p.waitForFunction(()=>document.querySelector('#taskVisibility').textContent.includes('3 / 7'));
   const popup=context.waitForEvent('page');await p.locator('#datahubLogs').click();const logPage=await popup;await logPage.waitForSelector('#logs');await logPage.waitForFunction(()=>document.querySelector('#logs').textContent.includes('独立日志测试'));
   if(errors.length)throw Error(errors.join(';'));
   await p.screenshot({path:path.join(root,'构建临时/DataHubCo页面验收.png'),fullPage:true});
