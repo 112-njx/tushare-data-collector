@@ -137,7 +137,7 @@ class Engine:
             if re.search(r'\binvalid_params\b',classification,re.I):
                 raise RemoteError('代理请求参数或字段不兼容：'+message,False)
             blocked=bool(re.search(r'封禁|封号|token.{0,12}(?:无效|错误|过期)|(?:invalid|expired)[_\s-]*token|token[_\s-]*(?:invalid|expired)|权限|无权|认证|授权|禁止|unauthorized|forbidden',classification,re.I))
-            transient=bool(re.search(r'频率|限流|每分钟|太频繁|too many|rate.limit|超时|timeout|系统.*错误|内部.*错误|服务.*异常|稍后|繁忙|temporar|unavailable',message,re.I))
+            transient=bool(re.search(r'频率|限流|每分钟|太频繁|too many|rate.limit|超时|timeout|系统.*错误|内部.*错误|服务.*异常|稍后|繁忙|temporar|unavailable|\[minute_upstream_busy\]|等待\s*\d+(?:\.\d+)?\s*秒后重试',classification,re.I))
             if blocked and not re.search(r'封禁|封号',classification):
                 kind='token' if re.search(r'token|令牌|认证|invalid|unauthorized',classification,re.I) else 'permission'
                 raise CredentialError('代理返回错误：'+message,kind)

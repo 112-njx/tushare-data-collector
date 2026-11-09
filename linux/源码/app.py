@@ -70,7 +70,7 @@ def main(open_browser=True):
                 elif self.path=='/api/datahub-logs':
                     state=engine.status();jobs=[j for j in state['jobs'] if j['provider']=='datahub']
                     self.send(dict(state='DataHubCo：'+('已配置' if state['datahub_configured'] else '未配置')+'；当前 '+str(state['workers'].get('datahub','等待'))+'；已完成 '+str(sum(j['status']=='complete' for j in jobs))+'/'+str(len(jobs))+'；上限 '+str(state['datahub_rpm'])+'/分钟',events=store.rows("SELECT time,message FROM events WHERE channel='datahub' ORDER BY id DESC LIMIT 200")))
-                elif self.path=='/api/catalog':self.send(catalog)
+                elif self.path=='/api/catalog':self.send(dict(catalog,entries=list(engine.catalog.values())))
                 elif self.path.startswith('/api/preview?'):
                     key=urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get('key',[''])[0]
                     rows=store.rows('SELECT path FROM files WHERE key=?',(key,))

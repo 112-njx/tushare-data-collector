@@ -30,6 +30,10 @@ REFERENCES={
 
 def profile(entry,catalog):
     ident=entry['id'];params=dict(DEFAULTS.get(ident,{}));schema=preferred_schema(entry)
+    from request_profiles import profile_params
+    params=profile_params(ident,params)
+    if ident=='namechange':schema=dict(mode='snapshot',key='',format='snapshot')
+    if ident=='fund_factor_pro':schema=dict(mode='day',key='trade_date',format='day')
     if ident in REFERENCES:
         target,source,field=REFERENCES[ident];params[target]={'$catalog':source,'field':field}
     generated={schema['key'],schema.get('end_key')} if schema['mode']!='snapshot' else set()
@@ -55,13 +59,15 @@ def build(engine,start,end,include_independent=False,include_overlap=False,prese
     for entry in entries:
         ident=entry['id'];old=engine.store.rows('SELECT * FROM jobs WHERE id=?',(ident,));reason='';state='pending'
         from providers import financial
-        if old and financial(entry):
-            with engine.store.db() as db:db.execute("UPDATE jobs SET status='excluded',error='按配置排除上市公司财务数据' WHERE id=?",(ident,))
-            report.append(dict(id=ident,title=entry['title'],status='excluded',reason='按配置排除上市公司财务数据，保留原断点与归档'));continue
+        from request_profiles import USER_EXCLUDED
+        exclusion='按用户设置排除，不再采集' if entry.get('excluded') and ident in USER_EXCLUDED else '按配置排除上市公司财务数据' if financial(entry) else ''
+        if old and exclusion:
+            with engine.store.db() as db:db.execute("UPDATE jobs SET status='excluded',error=? WHERE id=?",(exclusion,ident))
+            report.append(dict(id=ident,title=entry['title'],status='excluded',reason=exclusion));continue
         if preserve_existing and old and not json.loads(old[0]['plan']).get('bulk_placeholder'):
             report.append(dict(id=ident,title=entry['title'],status='kept',reason='保留已有计划范围、参数、状态及断点；配置账号不重放或自动延长历史'))
             continue
-        if financial(entry):state='excluded';reason='按配置排除上市公司财务数据'
+        if exclusion:state='excluded';reason=exclusion
         elif entry.get('excluded') or ident in DENIED:state='excluded';reason='本地重复数据或非采集接口'
         elif ident+'_vip' in engine.catalog:state='excluded';reason='由同字段全市场VIP接口覆盖，避免重复拉取'
         elif entry.get('independent'):state='excluded';reason='Linux版自动排除独立权限接口，不发送请求'

@@ -9,6 +9,7 @@ from core import Engine as BaseEngine,Store as BaseStore,CredentialError,RemoteE
 
 from history import latest,floor,previous,reverse_dates
 from providers import routed_ids,financial,import_coverage,page_key,DATAHUB_URL
+from request_profiles import USER_EXCLUDED, PROFILE_IDS, PAGED_DIRECTORIES, configure_catalog, profile_params
 
 RETRY_SECONDS=30
 class DirectoryUnavailable(ValueError):pass
@@ -34,25 +35,102 @@ class Store(BaseStore):
 
 class Engine(BaseEngine):
     def __init__(self,store,catalog,transport=None,data_root=DATA_ROOT):
-        super().__init__(store,catalog,transport,data_root)
+        super().__init__(store,configure_catalog(catalog),transport,data_root)
         self.local=threading.local();self.busy={};self.workers=[]
         self.thread=threading.Thread(target=self.supervise,name='采集调度器',daemon=True)
         self.phase='paused';self.calendar_cache=None
         self.datahub_ids=routed_ids(catalog)
         import_coverage(store,store.root.parent)
-        for job in store.rows('SELECT * FROM jobs'):self.reverse_job(job)
         # Old or manually imported plans cannot override the hard exclusion.
         with store.db() as db:
             for entry in self.catalog.values():
-                if entry.get('independent') or financial(entry):
+                if entry['id'] in USER_EXCLUDED:
+                    db.execute("UPDATE jobs SET status='excluded',error='按用户设置排除，不再采集',block_reason='' WHERE id=?",(entry['id'],))
+                elif entry.get('independent') or financial(entry):
                     db.execute("UPDATE jobs SET status='excluded',error=? WHERE id=?",('排除上市公司财务数据' if financial(entry) else 'Linux版排除独立权限接口',entry['id']))
             # Provider errors from the old supplier must not disable the new route.
             if not store.get('datahub_routing_v1'):
                 for ident in self.datahub_ids:
-                    if financial(self.catalog[ident]):continue
+                    if ident in USER_EXCLUDED or financial(self.catalog[ident]):continue
                     db.execute("UPDATE jobs SET status='pending',error='' WHERE id=? AND status='unavailable'",(ident,))
                     db.execute('DELETE FROM job_channels WHERE job=?',(ident,))
         store.set('datahub_routing_v1',True)
+        self.migrate_proxy_plans()
+        for job in store.rows('SELECT * FROM jobs'):self.reverse_job(job)
+
+    def migrate_proxy_plans(self):
+        """Repair the pending request without discarding committed pages."""
+        for job in self.store.rows('SELECT * FROM jobs'):
+            ident = job['id']
+            if ident not in self.catalog or job['status'] in ('excluded', 'complete'):
+                continue
+            plan = json.loads(job['plan'])
+            cursor = json.loads(job['cursor'])
+            if plan.get('bulk_placeholder') or cursor.get('offset') or plan.get('proxy_profile_v1'):
+                continue
+            busy_tdx = ident == 'tdx_index' and '[minute_upstream_busy]' in job['error']
+            if ident not in PROFILE_IDS | {'namechange'} and not busy_tdx:
+                continue
+            entry = self.catalog[ident]
+            plan.update(cap=entry['cap'], offset=entry.get('offset', False), proxy_profile_v1=True)
+            if plan.get('bulk'):
+                old_params = plan['params']
+                params = profile_params(ident, old_params)
+                if params != old_params and (not job['batches'] or ident == 'fut_basic'):
+                    plan['params'] = params
+                    plan.pop('resolved_params', None)
+                    plan['dependencies'] = self.dependencies(dict(params=params))
+                    if ident == 'fut_basic' and isinstance(params['fut_type'], list):
+                        # Each old exchange is now expanded into its contract types.
+                        cursor['variant'] *= len(params['fut_type'])
+                    elif not job['batches']:
+                        cursor.update(variant=0, date=latest(plan), offset=0, previous='')
+                if ident == 'namechange' and not job['batches']:
+                    plan.update(mode='snapshot', key='', schema=dict(mode='snapshot', key='', format='snapshot'))
+                    for key in ('direction','ascending_prefix','incremental_scope','history_version'):
+                        plan.pop(key, None)
+                    cursor.update(variant=0, date=plan['start'], offset=0, previous='')
+                if ident == 'fund_factor_pro' and not job['batches']:
+                    plan.update(mode='day', key='trade_date', schema=dict(mode='day', key='trade_date', format='day'),
+                                direction='desc', history_version=1)
+                    plan.pop('ascending_prefix', None)
+                    plan.pop('incremental_scope', None)
+                    cursor.update(variant=0, date=latest(plan), offset=0, previous='')
+                    cursor.pop('window_days', None)
+            with self.store.db() as db:
+                db.execute('INSERT INTO revisions(job,time,previous_plan,previous_cursor,previous_status) VALUES(?,?,?,?,?)',
+                           (ident,stamp(),job['plan'],job['cursor'],job['status']))
+                db.execute("UPDATE jobs SET plan=?,cursor=?,status='pending',error='',block_reason='' WHERE id=?",
+                           (json.dumps(plan),json.dumps(cursor),ident))
+                db.execute('DELETE FROM retries WHERE job=?',(ident,))
+                db.execute('DELETE FROM job_channels WHERE job=?',(ident,))
+
+    def accept(self,j,args,p,c,data):
+        if j['id'] in PAGED_DIRECTORIES and p.get('offset') and isinstance(data,dict):
+            items = data.get('items')
+            if isinstance(items,list) and len(items) > p['cap']:
+                raise ValueError('代理返回行数超过请求页大小，无法确认分页生效，保留断点')
+            fields = data.get('fields')
+            if items and c.get('offset') and isinstance(fields,list) and 'ts_code' in fields:
+                index = fields.index('ts_code')
+                codes = {row[index] for row in items if isinstance(row,list) and len(row) == len(fields)}
+                partition = {k:v for k,v in args.items() if k not in ('limit','offset')}
+                for record in self.store.rows('SELECT path FROM files WHERE job=?',(j['id'],)):
+                    path = Path(record['path']).resolve()
+                    if self.data_root.resolve() not in path.parents:
+                        raise ValueError('分页归档路径越界')
+                    old = json.loads(path.read_text(encoding='utf-8'))
+                    params = old.get('params',{})
+                    if 'offset' not in params or params['offset'] >= c['offset']:
+                        continue
+                    if partition != {k:v for k,v in params.items() if k not in ('limit','offset')}:
+                        continue
+                    old_fields = old['fields']
+                    if 'ts_code' in old_fields:
+                        old_index = old_fields.index('ts_code')
+                        if any(row[old_index] in codes for row in old['items']):
+                            raise ValueError('分页重复返回同一证券，无法确认偏移有效，保留断点')
+        return super().accept(j,args,p,c,data)
     def provider(self,ident):return 'datahub' if ident in self.datahub_ids else 'original'
     def quota_key(self,ident):return 'datahub_next_due' if ident in self.datahub_ids else 'next_due'
     def due(self,api,rpm):
@@ -90,6 +168,7 @@ class Engine(BaseEngine):
         return self.store.rows('SELECT * FROM jobs WHERE id=?',(j['id'],))[0]
     def update(self,ident,end=None):
         self.paused()
+        if ident in USER_EXCLUDED:raise ValueError('此项目已按用户设置排除')
         j=self.store.rows('SELECT * FROM jobs WHERE id=?',(ident,))
         if j and json.loads(j[0]['plan']).get('direction')=='desc' and j[0]['status']!='complete':
             raise ValueError('倒序历史尚未走完，请先续采原范围；完成后再更新至今天，避免覆盖未完成断点')
@@ -264,6 +343,7 @@ class Engine(BaseEngine):
         if not values:raise DirectoryUnavailable('目录已完成但没有可用代码，关联任务受阻：'+source)
         return sorted(values)
     def channel_for(self,api):
+        if api in USER_EXCLUDED:raise ValueError('此项目已按用户设置排除')
         if financial(self.catalog[api]):raise ValueError('上市公司财务数据禁止派发')
         if self.catalog[api].get('independent'):raise ValueError('独立权限接口禁止派发')
         if api in self.datahub_ids:return 'datahub'
@@ -299,7 +379,7 @@ class Engine(BaseEngine):
             if not any(self.store.get(k) for k in ('account','backup_account','datahub_account')):raise ValueError('请先配置至少一个Token')
             if ident:
                 rows=self.store.rows('SELECT * FROM jobs WHERE id=?',(ident,))
-                if not rows or financial(self.catalog[ident]) or self.catalog[ident].get('independent') or json.loads(rows[0]['plan']).get('bulk_placeholder'):raise ValueError('任务不存在或被排除，请先建立可执行计划')
+                if not rows or ident in USER_EXCLUDED or financial(self.catalog[ident]) or self.catalog[ident].get('independent') or json.loads(rows[0]['plan']).get('bulk_placeholder'):raise ValueError('任务不存在或被排除，请先建立可执行计划')
                 if rows[0]['status']=='complete':raise ValueError('请先更新已完成项目的日期范围')
                 with self.store.db() as db:
                     db.execute("UPDATE jobs SET status='pending',error='',block_reason='' WHERE id=?",(ident,))
